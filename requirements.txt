@@ -3,3 +3,4 @@ pymysql
 cryptography  
 openpyxl
 gunicorn
+certifi
