@@ -53,8 +53,16 @@ DB_CONFIG = {
     "user": os.environ.get("DB_USER", "root"),
     "password": os.environ.get("DB_PASSWORD", ""),
     "database": os.environ.get("DB_NAME", "ocean_restaurant"),
-    "ssl_disabled": False,
 }
+
+# Kết nối có mã hóa SSL (bắt buộc với TiDB Cloud): đặt DB_SSL=true trong .env.
+# DB_SSL_CA là đường dẫn file chứng chỉ CA; để trống thì dùng bộ chứng chỉ của gói certifi (pip install certifi).
+if os.environ.get("DB_SSL", "").strip().lower() in ("1", "true", "yes"):
+    _ca = os.environ.get("DB_SSL_CA", "").strip()
+    if not _ca:
+        import certifi
+        _ca = certifi.where()
+    DB_CONFIG.update(ssl_ca=_ca, ssl_verify_cert=True, ssl_verify_identity=True)
 
 BASE_DIR = Path(__file__).resolve().parent
 # File SQL chứa cấu trúc bảng + dữ liệu (đặt cùng thư mục với file .py này).
@@ -972,7 +980,7 @@ for _perm, _funcs in {
     "promotions": "promotions add_promotion delete_promotion promotions_report promotion_expiry_detail",
     "customers": "customers add_customer",
     "orders_create": "new_order add_order add_items_to_order process_add_items cancel_order cancel_order_item",
-    "orders_kitchen": "kitchen_alerts kitchen_ack confirm_order update_order_status",
+    "orders_kitchen": "kitchen_alerts kitchen_ack kitchen_ack_all confirm_order update_order_status",
     "analysis": "analysis export_analysis",
     "users": "users add_user toggle_user reset_password delete_user users_edit update_user",
 }.items():
@@ -1034,8 +1042,17 @@ def render_forbidden():
 # THÔNG BÁO CHO BẾP KHI KHÁCH GỌI THÊM MÓN
 # =========================================================
 
+# Chỉ báo các món gọi thêm trong khoảng này; món cũ hơn (vd dữ liệu mẫu nạp từ file SQL) không làm đầy màn hình.
+KITCHEN_ALERT_HOURS = 24
+KITCHEN_ALERT_SHOW = 3     # số đơn hiện sẵn trong khung thông báo, còn lại gộp thành "+N đơn khác"
+
+
 def get_kitchen_alerts(conn, order_id=None):
-    """Các món gọi thêm mà bếp chưa bấm 'Đã nhận', gom theo đơn."""
+    """Các món gọi thêm mà bếp chưa bấm 'Đã nhận', gom theo đơn (mới nhất trước).
+
+    Không truyền order_id: chỉ lấy món gọi trong KITCHEN_ALERT_HOURS giờ gần nhất.
+    Có order_id (trang chi tiết đơn): lấy mọi món chưa nhận của đơn đó.
+    """
     sql = """
         SELECT oi.order_id, o.table_number, o.customer_name, i.name AS item_name,
                (oi.quantity - COALESCE(oi.canceled_quantity, 0)) AS qty, oi.ordered_at
@@ -1050,7 +1067,10 @@ def get_kitchen_alerts(conn, order_id=None):
     if order_id:
         sql += " AND oi.order_id = ?"
         params.append(order_id)
-    sql += " ORDER BY oi.ordered_at, oi.order_id"
+    else:
+        sql += " AND oi.ordered_at >= ?"
+        params.append((datetime.now() - timedelta(hours=KITCHEN_ALERT_HOURS)).strftime("%Y-%m-%d %H:%M:%S"))
+    sql += " ORDER BY oi.ordered_at DESC, oi.order_id"
     grouped = {}
     for r in conn.execute(sql, params).fetchall():
         g = grouped.setdefault(r["order_id"], {"order_id": r["order_id"], "table": r["table_number"],
@@ -1060,23 +1080,35 @@ def get_kitchen_alerts(conn, order_id=None):
 
 
 def kitchen_alert_html(alerts):
+    """Khung thông báo gọn: tối đa KITCHEN_ALERT_SHOW đơn, mỗi đơn một dòng, kèm nút "Đã nhận tất cả"."""
     if not alerts:
         return ""
-    blocks = ""
-    for g in alerts:
-        blocks += f"""
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:6px 0;">
-            <div><strong>Đơn #{escape(g["order_id"])}</strong> ({escape(g["table"] or "Chưa có bàn")}) vừa gọi thêm lúc {escape(g["time"] or "")}:
-                {escape(", ".join(g["items"]))}</div>
-            <div class="actions">
-                <a class="btn btn-primary" href="/orders/{escape(g["order_id"])}">Xem đơn</a>
+    rows = ""
+    for g in alerts[:KITCHEN_ALERT_SHOW]:
+        time_txt = str(g["time"] or "")[11:16]
+        items = ", ".join(g["items"])
+        rows += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-top:1px solid #fde68a;">
+            <div style="min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="{escape(items)}">
+                <strong>#{escape(g["order_id"])}</strong> · {escape(g["table"] or "Chưa có bàn")} · {escape(time_txt)} — {escape(items)}</div>
+            <div class="actions" style="flex:none;">
+                <a class="btn btn-secondary" style="padding:4px 10px;" href="/orders/{escape(g["order_id"])}">Xem</a>
                 <form method="POST" action="/orders/{escape(g["order_id"])}/kitchen-ack" style="display:inline;">
-                    <button class="btn btn-warning">Đã nhận</button>
+                    <button class="btn btn-warning" style="padding:4px 10px;">Đã nhận</button>
                 </form>
             </div>
         </div>"""
-    return f"""<div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
-        <strong>Có món mới được gọi thêm!</strong>{blocks}</div>"""
+    more = len(alerts) - KITCHEN_ALERT_SHOW
+    more_html = (f'<a href="/orders?status=Chờ xác nhận" style="font-size:12.5px;">+{more} đơn khác</a>'
+                 if more > 0 else "")
+    ack_all = ("" if len(alerts) < 2 else
+               '<form method="POST" action="/kitchen/ack-all" style="display:inline;margin:0;">'
+               '<button class="btn btn-warning" style="padding:4px 10px;">Đã nhận tất cả</button></form>')
+    return f"""<div style="background:#fffbeb;border:1px solid #f59e0b;border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:4px;">
+            <strong style="color:#92400e;">{len(alerts)} đơn vừa gọi thêm món</strong>
+            <div class="actions">{more_html}{ack_all}</div>
+        </div>{rows}</div>"""
 
 
 @app.route("/kitchen/alerts")
@@ -1085,7 +1117,18 @@ def kitchen_alerts():
     conn = get_db()
     alerts = get_kitchen_alerts(conn)
     conn.close()
-    return jsonify({"count": len(alerts), "html": kitchen_alert_html(alerts)})
+    return jsonify({"count": len(alerts), "items": kitchen_notifications(alerts)})
+
+
+@app.route("/kitchen/ack-all", methods=["POST"])
+@role_required("admin", "chef")
+def kitchen_ack_all():
+    """Bếp bấm "Đã nhận tất cả": xác nhận mọi món gọi thêm còn chưa nhận."""
+    conn = get_db()
+    conn.execute("UPDATE order_details SET kitchen_ack = 1 WHERE kitchen_ack = 0")
+    conn.commit()
+    conn.close()
+    return redirect(request.referrer or url_for("orders"))
 
 
 @app.route("/orders/<string:id>/kitchen-ack", methods=["POST"])
@@ -1846,12 +1889,15 @@ def render_page(title, body, active):
     else:
         user_block = ""
 
-    # Chuông thông báo cạnh tài khoản: gom các cảnh báo tồn kho và hạn sử dụng.
+    # Chuông thông báo cạnh tài khoản: món gọi thêm cho bếp (nếu có quyền) + cảnh báo tồn kho, hạn sử dụng.
     bell_block = ""
     if user:
         _nc = get_db()
         try:
-            bell_block = notification_bell_html(build_notifications(get_inventory_alerts(_nc)), user["user_id"])
+            is_kitchen = has_perm(user, "orders_kitchen")
+            notes = kitchen_notifications(get_kitchen_alerts(_nc)) if is_kitchen else []
+            notes += build_notifications(get_inventory_alerts(_nc))
+            bell_block = notification_bell_html(notes, user["user_id"], kitchen=is_kitchen)
         finally:
             _nc.close()
 
@@ -1872,32 +1918,6 @@ def render_page(title, body, active):
                 history.replaceState(null, '', u.pathname + u.search + u.hash);
             } catch (e) {}
         })();
-        </script>"""
-
-    kitchen_block = ""
-    if has_perm(user, "orders_kitchen"):
-        _c = get_db()
-        _alerts = get_kitchen_alerts(_c)
-        _c.close()
-        kitchen_block = f"""<div id="kitchen-alert">{kitchen_alert_html(_alerts)}</div>
-        <script>
-        (function() {{
-            var last = {len(_alerts)};
-            function beep() {{
-                try {{
-                    var ctx = new (window.AudioContext || window.webkitAudioContext)();
-                    var o = ctx.createOscillator(); o.frequency.value = 880; o.connect(ctx.destination);
-                    o.start(); setTimeout(function() {{ o.stop(); ctx.close(); }}, 250);
-                }} catch (e) {{}}
-            }}
-            setInterval(function() {{
-                fetch('/kitchen/alerts').then(function(r) {{ return r.json(); }}).then(function(d) {{
-                    document.getElementById('kitchen-alert').innerHTML = d.html;
-                    if (d.count > last) beep();
-                    last = d.count;
-                }}).catch(function() {{}});
-            }}, 10000);
-        }})();
         </script>"""
 
     return f"""
@@ -1925,7 +1945,6 @@ def render_page(title, body, active):
             {user_block}
         </div>
         <div class="content">
-        {kitchen_block}
         {body}
         </div>
     </div>
@@ -2985,6 +3004,18 @@ def material_tabs(active, alert_count=0):
 
 # ---------- Chuông thông báo (cạnh tài khoản) ----------
 
+def kitchen_notifications(alerts):
+    """Món gọi thêm (chưa bấm "Đã nhận") thành mục trong chuông thông báo."""
+    items = []
+    for g in alerts:
+        when = str(g["time"] or "")[11:16]
+        items.append({"key": f'kitchen:{g["order_id"]}:{g["time"]}', "level": "blue", "kind": "kitchen",
+                      "href": f'/orders/{g["order_id"]}',
+                      "title": f'Đơn #{g["order_id"]} ({g["table"] or "chưa có bàn"}) gọi thêm món',
+                      "sub": f'{when} · ' + ", ".join(g["items"])})
+    return items
+
+
 def build_notifications(alerts):
     """Chuyển các cảnh báo kho thành danh sách thông báo cho chuông ở góc trên."""
     items = []
@@ -3024,7 +3055,9 @@ NOTIF_STYLE = """<style>
   .nt-item:hover { background:#f8fcff; }
   .nt-item.unread { background:#f0f9ff; }
   .nt-dot { width:8px; height:8px; border-radius:50%; flex:none; margin-top:6px; }
-  .nt-red { background:#e11d48; } .nt-amber { background:#f59e0b; } .nt-green { background:#65a30d; }
+  .nt-red { background:#e11d48; } .nt-amber { background:#f59e0b; } .nt-green { background:#65a30d; } .nt-blue { background:#1769e0; }
+  .nt-ack { margin:0; } .nt-ack button { border:0; background:none; color:#1769e0; font:inherit; font-size:12px; font-weight:700; cursor:pointer; padding:0; }
+  .nt-text small { overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
   .nt-text { min-width:0; }
   .nt-text b { display:block; font-size:13px; font-weight:700; color:#172b4d; }
   .nt-text small { display:block; font-size:12px; color:#64748b; }
@@ -3043,45 +3076,85 @@ NOTIF_SCRIPT = """<script>
   var wrap = document.getElementById('nt-wrap');
   if (!wrap) return;
   var btn = document.getElementById('nt-btn'), panel = document.getElementById('nt-panel'), badge = document.getElementById('nt-badge');
-  var items = Array.prototype.slice.call(panel.querySelectorAll('.nt-item'));
+  var list = panel.querySelector('.nt-list'), countEl = document.getElementById('nt-count'), ackForm = document.getElementById('nt-ack');
   var storeKey = 'ocean_notif_seen_' + wrap.dataset.user, seen = [];
   try { seen = JSON.parse(localStorage.getItem(storeKey) || '[]'); } catch (e) {}
-  var unread = items.filter(function (a) { return seen.indexOf(a.dataset.key) === -1; });
-  unread.forEach(function (a) { a.classList.add('unread'); });
-  if (unread.length) { badge.textContent = unread.length > 99 ? '99+' : unread.length; badge.hidden = false; }
+  function items() { return Array.prototype.slice.call(list.querySelectorAll('.nt-item')); }
+  function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function refreshBadge() {
+    var all = items(), unread = 0;
+    all.forEach(function (a) { var u = seen.indexOf(a.dataset.key) === -1; a.classList.toggle('unread', u); if (u) unread++; });
+    badge.textContent = unread > 99 ? '99+' : unread;
+    badge.hidden = !unread || !panel.hidden;
+    if (countEl) countEl.textContent = all.length ? all.length + ' thông báo' : '';
+    if (ackForm) ackForm.hidden = !list.querySelector('.nt-item[data-kind="kitchen"]');
+    var empty = list.querySelector('.nt-empty');
+    if (empty) empty.hidden = all.length > 0;
+  }
+  function markSeen() {
+    seen = items().map(function (a) { return a.dataset.key; });
+    try { localStorage.setItem(storeKey, JSON.stringify(seen)); } catch (e) {}
+  }
   function toggle(show) {
     panel.hidden = !show;
     btn.setAttribute('aria-expanded', show ? 'true' : 'false');
-    if (show) {
-      badge.hidden = true;
-      try { localStorage.setItem(storeKey, JSON.stringify(items.map(function (a) { return a.dataset.key; }))); } catch (e) {}
-    }
+    if (show) markSeen();
+    refreshBadge();
   }
   btn.addEventListener('click', function (e) { e.stopPropagation(); toggle(panel.hidden); });
   document.addEventListener('click', function (e) { if (!wrap.contains(e.target)) toggle(false); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') toggle(false); });
+  refreshBadge();
+
+  if (wrap.dataset.kitchen !== '1') return;
+  function beep() {
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      var o = ctx.createOscillator(); o.frequency.value = 880; o.connect(ctx.destination);
+      o.start(); setTimeout(function () { o.stop(); ctx.close(); }, 250);
+    } catch (e) {}
+  }
+  setInterval(function () {
+    fetch('/kitchen/alerts', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+      var old = items().filter(function (a) { return a.dataset.kind === 'kitchen'; });
+      var oldKeys = old.map(function (a) { return a.dataset.key; });
+      old.forEach(function (a) { a.remove(); });
+      var html = (d.items || []).map(function (n) {
+        return '<a class="nt-item" href="' + esc(n.href) + '" data-key="' + esc(n.key) + '" data-kind="kitchen">'
+             + '<span class="nt-dot nt-blue"></span><span class="nt-text"><b>' + esc(n.title) + '</b><small>' + esc(n.sub) + '</small></span></a>';
+      }).join('');
+      list.insertAdjacentHTML('afterbegin', html);
+      if ((d.items || []).some(function (n) { return oldKeys.indexOf(n.key) === -1 && seen.indexOf(n.key) === -1; })) beep();
+      if (!panel.hidden) markSeen();
+      refreshBadge();
+    }).catch(function () {});
+  }, 10000);
 })();
 </script>"""
 
 
-def notification_bell_html(items, user_id=""):
+def notification_bell_html(items, user_id="", kitchen=False):
     rows = ""
     for n in items:
-        rows += (f'<a class="nt-item" href="{escape(n["href"])}" data-key="{escape(n["key"])}">'
+        kind = n.get("kind", "stock")
+        rows += (f'<a class="nt-item" href="{escape(n["href"])}" data-key="{escape(n["key"])}" data-kind="{kind}">'
                  f'<span class="nt-dot nt-{n["level"]}"></span>'
                  f'<span class="nt-text"><b>{escape(n["title"])}</b><small>{escape(n["sub"])}</small></span></a>')
-    if not rows:
-        rows = '<div class="nt-empty">Không có thông báo nào.</div>'
-    count = f"<small>{len(items)} cảnh báo</small>" if items else ""
+    rows += '<div class="nt-empty">Không có thông báo nào.</div>'
+    ack = ""
+    if kitchen:
+        has_kitchen = any(n.get("kind") == "kitchen" for n in items)
+        ack = (f'<form method="POST" action="/kitchen/ack-all" class="nt-ack" id="nt-ack"{"" if has_kitchen else " hidden"}>'
+               f'<button title="Bếp đã nhận mọi món gọi thêm">Đã nhận món gọi thêm</button></form>')
     return f"""{NOTIF_STYLE}
-    <div class="nt-wrap" id="nt-wrap" data-user="{escape(user_id)}">
+    <div class="nt-wrap" id="nt-wrap" data-user="{escape(user_id)}" data-kitchen="{"1" if kitchen else "0"}">
         <button type="button" class="nt-btn" id="nt-btn" aria-label="Thông báo" aria-expanded="false" title="Thông báo">
             {NOTIF_BELL_SVG}<span class="nt-badge" id="nt-badge" hidden>0</span>
         </button>
         <div class="nt-panel" id="nt-panel" hidden>
-            <div class="nt-head"><span>Thông báo</span>{count}</div>
+            <div class="nt-head"><span>Thông báo <small id="nt-count"></small></span>{ack}</div>
             <div class="nt-list">{rows}</div>
-            <a class="nt-foot" href="/inventory/check">Xem tất cả cảnh báo</a>
+            <a class="nt-foot" href="/inventory/check">Xem tất cả cảnh báo kho</a>
         </div>
     </div>
     {NOTIF_SCRIPT}"""
