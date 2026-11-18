@@ -1,0 +1,8 @@
+# Mật khẩu và cấu hình riêng
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
