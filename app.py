@@ -721,8 +721,9 @@ def get_best_sellers(conn, limit=5, days=30):
 
 
 def get_order_screen_context(conn):
-    best, label = get_best_sellers(conn)
-    rank_map = {b["item_id"]: i + 1 for i, b in enumerate(best)}
+    ranked, label = get_best_sellers(conn, limit=HOT_TOP_SELLERS)
+    rank_map = {b["item_id"]: i + 1 for i, b in enumerate(ranked)}
+    best = ranked[:5]
     blocked = get_unavailable_item_ids(conn)
     sale = get_expiry_item_discounts(conn)
     return best, label, rank_map, blocked, sale
@@ -763,21 +764,54 @@ def hot_badge_html(title="", width=72):
     return HOT_BADGE_SVG.format(w=width, h=round(width * 0.6), title=escape(title))
 
 
+# ---- Quy tắc gắn huy hiệu "Hot !!!" ----
+HOT_MIN_DISCOUNT = 20   # món đang giảm từ mức này trở lên (khuyến mại theo món hoặc xả hàng HSD) là Hot
+HOT_TOP_SELLERS = 10    # 10 món bán chạy nhất 30 ngày gần nhất được gắn Hot
+
+
 def is_hot_discount(pct):
-    """Mức giảm xả hàng cao nhất (30%) được gắn biểu tượng Hot thay cho nhãn số ngày còn lại."""
-    return float(pct or 0) >= EXPIRY_DISCOUNT_RULES[0][1]
+    """Mức giảm đủ lớn để gắn biểu tượng Hot."""
+    return float(pct or 0) >= HOT_MIN_DISCOUNT
+
+
+def get_hot_items(conn):
+    """{item_id: lý do Hot} – gồm top món bán chạy và món đang giảm sâu."""
+    hot = {}
+    best, _ = get_best_sellers(conn, limit=HOT_TOP_SELLERS)
+    for i, b in enumerate(best, 1):
+        hot[b["item_id"]] = f"Bán chạy #{i}"
+    today = date.today().isoformat()
+    for r in conn.execute("""SELECT item_id, MAX(discount) AS d FROM promotions
+                             WHERE apply_type = 'item' AND item_id IS NOT NULL AND start_date <= ? AND end_date >= ?
+                             GROUP BY item_id""", (today, today)).fetchall():
+        if is_hot_discount(r["d"]):
+            hot[r["item_id"]] = f'Đang giảm {float(r["d"]):g}%'
+    for item_id, x in get_expiry_item_discounts(conn).items():
+        if is_hot_discount(x["discount"]):
+            hot[item_id] = f'Đang giảm {x["discount"]:g}% (xả HSD)'
+    return hot
+
+
+def hot_for(item_id, hot, width=54):
+    """Huy hiệu Hot nếu món nằm trong danh sách Hot, ngược lại chuỗi rỗng."""
+    return (" " + hot_badge_html(hot[item_id], width)) if hot and item_id in hot else ""
 
 
 def item_flags_html(item_id, rank_map=None, blocked=None, sale=None):
     html = ""
+    hot_reason = ""
     if rank_map and item_id in rank_map:
-        html += f' <span class="status yellow">Bán chạy #{rank_map[item_id]}</span>'
+        html += f' <span class="status yellow">🔥 Bán chạy #{rank_map[item_id]}</span>'
+        if rank_map[item_id] <= HOT_TOP_SELLERS:
+            hot_reason = f"Bán chạy #{rank_map[item_id]}"
     if sale and item_id in sale:
         s = sale[item_id]
         tip = f'Nguyên liệu {s["ingredient_name"]} {days_text(s["days_left"])}'
         if is_hot_discount(s["discount"]):
-            html += " " + hot_badge_html(tip, 58)
-        html += (f' <span class="status green" title="{escape(tip)}">Giảm {s["discount"]:g}% (xả HSD)</span>')
+            hot_reason = f'Giảm {s["discount"]:g}% · {tip}'
+        html += (f' <span class="status green" title="{escape(tip)}">🍃 Giảm {s["discount"]:g}% (xả HSD)</span>')
+    if hot_reason:
+        html = " " + hot_badge_html(hot_reason, 54) + html
     if blocked and item_id in blocked:
         html += ' <span class="status red">Hết nguyên liệu</span>'
     return html
@@ -790,6 +824,8 @@ def best_seller_panel_html(best, label, blocked=None, sale=None):
     cards = ""
     for idx, b in enumerate(best):
         rank = ["🥇", "🥈", "🥉"][idx] if idx < 3 else f"#{idx + 1}"
+        if idx < HOT_TOP_SELLERS:
+            rank += " " + hot_badge_html(f"Bán chạy #{idx + 1}", 50)
         img = FOOD_IMAGES.get(b["category_id"], FOOD_IMAGE_DEFAULT)
         warn = ""
         if b["item_id"] in blocked:
@@ -2158,6 +2194,7 @@ def categories():
         WHERE items.name LIKE ? OR categories.name LIKE ? OR items.item_id LIKE ?
         ORDER BY {item_order}
     """, (f"%{item_search}%", f"%{item_search}%", f"%{item_search}%")).fetchall()
+    hot = get_hot_items(conn)
     conn.close()
 
     error = request.args.get("error", "")
@@ -2206,7 +2243,7 @@ def categories():
         <tr>
             <td><img class="food-thumb" src="{food_image}" alt="Ảnh món {escape(item["name"])}" loading="lazy" onerror="this.onerror=null;this.src='{FOOD_PLACEHOLDER}'"></td>
             <td>{item["item_id"]}</td>
-            <td><span class="food-name">{escape(item["name"])}</span></td>
+            <td><span class="food-name">{escape(item["name"])}</span>{hot_for(item["item_id"], hot)}</td>
             <td>{escape(item["category_name"])}</td>
             <td>{item["price"]:,.0f} đ</td>
             <td><span class="status {css_status(item["status"])}">{escape(item["status"])}</span></td>
@@ -2732,7 +2769,7 @@ def get_expiry_item_discounts(conn, check_date=None):
     return result
 
 
-def promo_banner_html(promos, expiry_programs, tiers):
+def promo_banner_html(promos, expiry_programs, tiers, hot_list=None):
     """Banner ưu đãi đầu trang Quản lý khuyến mại, dựng từ các chương trình đang chạy thật."""
     today = date.today().isoformat()
 
@@ -2782,7 +2819,7 @@ def promo_banner_html(promos, expiry_programs, tiers):
             parts.append(f"{len(item_now)} chương trình theo món")
         if sale_items:
             parts.append(f"{len(sale_items)} món xả hàng theo hạn sử dụng")
-        hot = hot_badge_html("Mức giảm cao nhất", 64) if is_hot_discount(sale_max) else ""
+        hot = hot_badge_html("Mức giảm cao nhất", 64) if is_hot_discount(best_item) else ""
         t_item = ticket("Giảm giá món", f'{best_item:g}%{hot}', f"giảm đến mức này cho {n_items} món chọn lọc",
                         " · ".join(parts), "red")
     elif item_next:
@@ -2801,8 +2838,17 @@ def promo_banner_html(promos, expiry_programs, tiers):
     else:
         t_tier = ""
 
+    hot_strip = ""
+    if hot_list:
+        chips = "".join(f'<span class="pb-hot-chip">{hot_badge_html(why, 46)}<b>{escape(name)}</b><small>{escape(why)}</small></span>'
+                        for name, why in hot_list[:12])
+        hot_strip = f'<div class="pb-hot"><span class="pb-hot-label">🔥 Món Hot hôm nay</span>{chips}</div>'
     return f"""
     <style>
+      .pb-hot {{ position:relative; display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:14px; }}
+      .pb-hot-label {{ font-size:12px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; color:#fde047; margin-right:4px; }}
+      .pb-hot-chip {{ display:inline-flex; align-items:center; gap:6px; padding:4px 12px 4px 6px; border-radius:999px; background:#fff; color:#0f172a; font-size:13px; }}
+      .pb-hot-chip small {{ color:#b91c1c; font-weight:700; font-size:11px; }}
       .pb {{ position:relative; overflow:hidden; margin-bottom:18px; padding:24px 26px; border-radius:20px; color:#fff;
              background:radial-gradient(circle at 12% 0%, #0e7490 0, transparent 46%), linear-gradient(120deg,#06283d 0%,#0b4a6f 55%,#0e7490 100%);
              box-shadow:0 14px 34px rgba(8,47,73,.22); }}
@@ -2834,6 +2880,7 @@ def promo_banner_html(promos, expiry_programs, tiers):
         <div class="pb-actions"><a href="#add-promo">+ Thêm chương trình</a><a class="alt" href="#order-report">Xem báo cáo</a></div>
       </div>
       <div class="pb-tickets">{t_order}{t_item}{t_tier}</div>
+      {hot_strip}
     </div>"""
 
 
@@ -4605,7 +4652,7 @@ def promotions():
         merged.append(d)
     report_data = sorted(merged, key=lambda d: (-float(d["discount_total"] or 0), -int(d["order_count"] or 0), d["name"]))
     item_report_sql = """
-        SELECT p.promotion_id, p.name AS promo_name, p.discount, i.name AS item_name,
+        SELECT p.promotion_id, p.item_id, p.name AS promo_name, p.discount, i.name AS item_name,
                COUNT(DISTINCT o.order_id) AS order_count,
                COALESCE(SUM(CASE WHEN o.order_id IS NOT NULL THEN oi.quantity - COALESCE(oi.canceled_quantity, 0) END), 0) AS qty,
                COALESCE(SUM(CASE WHEN o.order_id IS NOT NULL THEN oi.item_discount END), 0) AS discount_total,
@@ -4623,7 +4670,7 @@ def promotions():
         item_report_sql += " AND p.item_id = ?"
         item_report_params.append(report_item)
     item_report_sql += """
-        GROUP BY p.promotion_id, p.name, p.discount, i.name
+        GROUP BY p.promotion_id, p.item_id, p.name, p.discount, i.name
         ORDER BY discount_total DESC, qty DESC, i.name
     """
     item_report_data = conn.execute(item_report_sql, item_report_params).fetchall()
@@ -4631,14 +4678,18 @@ def promotions():
         "SELECT DISTINCT item_id FROM promotions WHERE apply_type = 'item' AND item_id IS NOT NULL").fetchall()}
     tiers = conn.execute("SELECT * FROM member_tiers WHERE discount_percent > 0 ORDER BY min_total_spent").fetchall()
     expiry_programs = get_expiry_programs(conn)
+    hot = get_hot_items(conn)
     conn.close()
+    item_names = {it["item_id"]: it["name"] for it in items}
+    # Giữ thứ tự của get_hot_items: món bán chạy #1, #2... rồi đến món đang giảm sâu.
+    hot_list = [(item_names.get(i, i), why) for i, why in hot.items()]
 
     item_report_rows = ""
     sum_orders = sum_qty = sum_disc = sum_rev = 0
     for r in item_report_data:
         sum_orders += r["order_count"]; sum_qty += r["qty"]
         sum_disc += r["discount_total"]; sum_rev += r["revenue_total"]
-        item_report_rows += f"""<tr><td>{escape(r['item_name'])}</td><td>{escape(r['promo_name'])}</td>
+        item_report_rows += f"""<tr><td>{escape(r['item_name'])}{hot_for(r["item_id"], hot, 50)}</td><td>{escape(r['promo_name'])}</td>
           <td>{r['discount']:g}%</td><td>{r['order_count']}</td><td>{r['qty']:g}</td>
           <td>{r['discount_total']:,.0f} đ</td><td>{r['revenue_total']:,.0f} đ</td></tr>"""
     if item_report_rows:
@@ -4666,14 +4717,15 @@ def promotions():
         stats[status] += 1
 
         if promotion["apply_type"] == "item" and promotion["item_name"]:
-            apply_label = f'<span class="status blue">Theo món</span> {escape(promotion["item_name"])}'
+            apply_label = (f'<span class="status blue">Theo món</span> {escape(promotion["item_name"])}'
+                           + hot_for(promotion["item_id"], hot, 50))
         else:
             apply_label = '<span class="status green">Toàn đơn</span>'
 
         rows += f"""
         <tr>
             <td>{promotion["promotion_id"]}</td>
-            <td>{escape(promotion["name"])}</td>
+            <td>{escape(promotion["name"])}{" " + hot_badge_html(f"Đang giảm {promotion['discount']:g}%", 50) if status == "Đang diễn ra" and is_hot_discount(promotion["discount"]) else ""}</td>
             <td>{apply_label}</td>
             <td>{promotion["discount"]:g}%</td>
             <td>{promotion["min_order_value"]:,.0f} đ</td>
@@ -4799,7 +4851,7 @@ def promotions():
         <div><h1>Quản lý khuyến mại</h1></div>
     </div>
     {message}
-    {promo_banner_html(all_promos, expiry_programs, tiers)}
+    {promo_banner_html(all_promos, expiry_programs, tiers, hot_list)}
     {promo_tabs}
     <script>
         function toggleItemSelect() {{
@@ -7016,9 +7068,9 @@ def analysis():
         share = (top[0]["total_revenue"] / total_rev * 100) if total_rev else 0
         best_html = f"""
         <div style="display:grid;grid-template-columns:minmax(300px,1.3fr) 1fr;gap:14px;">
-          <div>{analysis_card_html(top[0], "#16a34a", big=True, medal="🏆 Bán chạy nhất –")}
+          <div>{analysis_card_html(top[0], "#16a34a", big=True, medal="🏆 " + hot_badge_html("Bán chạy #1", 64) + " Bán chạy nhất –")}
             <p class="muted" style="margin-top:8px;">Chiếm {share:.1f}% doanh thu.</p></div>
-          <div style="display:grid;gap:10px;">{"".join(analysis_card_html(r, "#16a34a", medal=medals[i + 1]) for i, r in enumerate(top[1:]))}</div>
+          <div style="display:grid;gap:10px;">{"".join(analysis_card_html(r, "#16a34a", medal=medals[i + 1] + (" " + hot_badge_html(f"Bán chạy #{i + 2}", 50) if i + 2 <= HOT_TOP_SELLERS else "")) for i, r in enumerate(top[1:]))}</div>
         </div>"""
 
     # --- biểu đồ cột món bán chạy: màu theo mức bán (bán chạy / trung bình / bán chậm) ---
@@ -7104,7 +7156,7 @@ def analysis():
         rows += f"""
         <tr>
           <td style="border-left:5px solid {color};">{r["rank"] if r["rank"] else "—"}</td>
-          <td><div style="display:flex;gap:10px;align-items:center;">{food_thumb_html(r["category_id"], r["item_name"])}<span class="food-name">{escape(r['item_name'])}</span></div></td>
+          <td><div style="display:flex;gap:10px;align-items:center;">{food_thumb_html(r["category_id"], r["item_name"])}<span class="food-name">{escape(r['item_name'])}</span>{" " + hot_badge_html(f"Bán chạy #{r['rank']}", 50) if r["rank"] and r["rank"] <= HOT_TOP_SELLERS else ""}</div></td>
           <td>{escape(r['category_name'])}</td>
           <td><strong style="color:{color};">{r['total_sold']:g}</strong></td>
           <td>{r['total_revenue']:,.0f} đ</td><td>{share_txt}</td>
