@@ -53,6 +53,7 @@ DB_CONFIG = {
     "user": os.environ.get("DB_USER", "root"),
     "password": os.environ.get("DB_PASSWORD", ""),
     "database": os.environ.get("DB_NAME", "ocean_restaurant"),
+    "ssl_disabled": False,
 }
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -6692,86 +6693,148 @@ def suggest_discount(order_count):
     return 0
 
 
-def column_chart_svg(bars, color, unit, label_color="#0f2d4b"):
-    """Biểu đồ cột dọc có nhãn giá trị trên đầu cột. bars = [{label, value, note?}] (note: nhãn phụ, vd "-50%")."""
+def nice_axis(vmax, ticks=4):
+    """Bước chia trục tròn số (1, 2, 5 × 10^n) -> (bước, giá trị đỉnh trục). Tránh nhãn lẻ kiểu 27, 54, 81."""
+    if vmax <= 0:
+        return 1, ticks
+    raw = vmax / ticks
+    mag = 10 ** math.floor(math.log10(raw)) if raw >= 1 else 1
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    step = max(1, int(step))
+    return step, step * math.ceil(vmax / step)
+
+
+def chart_legend_html(items):
+    """Chú thích màu dưới biểu đồ. items = [(nhãn, màu), ...]"""
+    return ('<div style="display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:8px;font-size:12.5px;color:#475569;">'
+            + "".join(f'<span style="display:inline-flex;align-items:center;gap:6px;">'
+                      f'<i style="width:12px;height:12px;border-radius:3px;background:{c};display:inline-block;"></i>{escape(l)}</span>'
+                      for l, c in items)
+            + "</div>")
+
+
+def column_chart_svg(bars, color, unit, label_color="#0f2d4b", legend=None):
+    """Biểu đồ cột dọc có nhãn giá trị trên đầu cột.
+
+    bars = [{label, value, color?, note?}]: mỗi cột có thể có màu riêng (vd theo mức bán chạy / mức giảm giá);
+    note là nhãn phụ trên đầu cột (vd "-50%"). legend = [(nhãn, màu)] để in chú thích màu.
+    """
     if not bars:
         return '<p class="empty">Chưa có dữ liệu để vẽ biểu đồ.</p>'
     n = len(bars)
     has_note = any(b.get("note") for b in bars)
     W, H, L, R, T, B = 760, 340, 44, 12, (52 if has_note else 30), 104
-    vmax = max(b["value"] for b in bars)
-    step = max(1, math.ceil(vmax / 4)) if vmax > 0 else 1
-    top = step * 4
+    step, top = nice_axis(max(b["value"] for b in bars))
+    plot_h = H - T - B
     band = (W - L - R) / n
     bw = min(64, band * 0.62)
     out = ""
-    for k in range(5):
-        gy = T + (H - T - B) * (1 - k / 4)
+    for k in range(int(top // step) + 1):
+        tick = step * k
+        gy = T + plot_h * (1 - tick / top)
         out += (f'<line x1="{L}" y1="{gy:.1f}" x2="{W - R}" y2="{gy:.1f}" stroke="#e2e8f0"/>'
-                f'<text x="{L - 8}" y="{gy + 4:.1f}" text-anchor="end" font-size="11" fill="#64748b">{step * k:g}</text>')
+                f'<text x="{L - 8}" y="{gy + 4:.1f}" text-anchor="end" font-size="11" fill="#64748b">{tick:g}</text>')
     for i, b in enumerate(bars):
         v = b["value"]
-        h = max(2.0, (H - T - B) * v / top)
+        c = b.get("color") or color
+        h = plot_h * v / top if v > 0 else 0
         cx = L + band * i + band / 2
-        y = H - B - h
+        y = H - B - max(h, 3)
         name = b["label"] if len(b["label"]) <= 22 else b["label"][:21].rstrip() + "…"
-        out += (f'<rect x="{cx - bw / 2:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{h:.1f}" rx="4" fill="{color}">'
-                f'<title>{escape(b["label"])}: {v:g} {unit}</title></rect>'
+        # Cột bằng 0 vẫn để lại một vạch mờ để thấy món đó có trong danh sách.
+        out += (f'<rect x="{cx - bw / 2:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{max(h, 3):.1f}" rx="3" fill="{c}"'
+                f'{"" if v > 0 else " opacity=.35"}><title>{escape(b["label"])}: {v:g} {unit}</title></rect>'
                 f'<text x="{cx:.1f}" y="{y - 7:.1f}" text-anchor="middle" font-size="13" font-weight="800" fill="{label_color}">{v:g}</text>')
         if b.get("note"):
-            out += (f'<rect x="{cx - 21:.1f}" y="{y - 41:.1f}" width="42" height="18" rx="9" fill="#fef2f2" stroke="{color}"/>'
-                    f'<text x="{cx:.1f}" y="{y - 28:.1f}" text-anchor="middle" font-size="11" font-weight="800" fill="{color}">{escape(b["note"])}</text>')
+            out += (f'<rect x="{cx - 21:.1f}" y="{y - 41:.1f}" width="42" height="18" rx="9" fill="#fff" stroke="{c}"/>'
+                    f'<text x="{cx:.1f}" y="{y - 28:.1f}" text-anchor="middle" font-size="11" font-weight="800" fill="{c}">{escape(b["note"])}</text>')
         out += (f'<text transform="translate({cx + 4:.1f},{H - B + 14}) rotate(-35)" text-anchor="end" font-size="11.5" '
                 f'fill="#334155">{escape(name)}</text>')
     out += f'<text x="{L - 34}" y="{T - 14}" font-size="11" fill="#64748b">{unit}</text>'
-    return f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;max-height:380px;" role="img">{out}</svg>'
+    svg = f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;max-height:380px;" role="img">{out}</svg>'
+    return svg + (chart_legend_html(legend) if legend else "")
+
+
+def _next_month(d):
+    return date(d.year + (d.month == 12), d.month % 12 + 1, 1)
 
 
 def trend_svg(points, start, end):
-    """Biểu đồ đường số phần bán theo ngày (SVG thuần, không cần thư viện ngoài)."""
-    if not points:
-        return '<p class="empty">Chưa có dữ liệu để vẽ biểu đồ theo ngày.</p>'
-    by_day = {p[0]: p[1] for p in points}
+    """Số đơn theo thời gian, dạng cột. points = [(ngày iso, số đơn, số phần)].
+
+    Khoảng ≤ 3 tháng vẽ theo ngày, ≤ 13 tháng gom theo tuần, dài hơn gom theo tháng, để cột không quá mảnh.
+    """
+    days = [(parse_iso_date(d), int(o or 0), float(q or 0)) for d, o, q in points]
+    days = [x for x in days if x[0]]
+    if not days:
+        return '<p class="empty">Không có đơn hàng nào trong khoảng thời gian này.</p>'
     d0, d1 = parse_iso_date(start), parse_iso_date(end)
-    series = []
-    if d0 and d1 and 0 <= (d1 - d0).days <= 120:
-        cur = d0
-        while cur <= d1:
-            series.append((cur.isoformat(), by_day.get(cur.isoformat(), 0)))
-            cur += timedelta(days=1)
+    if not d0 or not d1 or d1 < d0:
+        d0, d1 = min(x[0] for x in days), max(x[0] for x in days)
+    span = (d1 - d0).days + 1
+    if span <= 92:
+        mode, unit_name = "day", "ngày"
+        key, nxt, fmt = (lambda d: d), (lambda d: d + timedelta(days=1)), (lambda d: d.strftime("%d/%m"))
+    elif span <= 400:
+        mode, unit_name = "week", "tuần"
+        key = lambda d: d - timedelta(days=d.weekday())
+        nxt, fmt = (lambda d: d + timedelta(days=7)), (lambda d: "Tuần " + d.strftime("%d/%m"))
     else:
-        series = sorted(by_day.items())
-    W, H, L, R, T, B = 760, 250, 46, 16, 16, 34
-    vmax = max(v for _, v in series) or 1
+        mode, unit_name = "month", "tháng"
+        key, nxt, fmt = (lambda d: d.replace(day=1)), _next_month, (lambda d: d.strftime("%m/%Y"))
+    buckets, cur = [], key(d0)
+    while cur <= d1:
+        buckets.append(cur)
+        cur = nxt(cur)
+    agg = {k: [0, 0.0] for k in buckets}
+    for d, o, q in days:
+        k = key(d)
+        if k in agg:
+            agg[k][0] += o
+            agg[k][1] += q
+    series = [(k, agg[k][0], agg[k][1]) for k in buckets]
+    total_o = sum(o for _, o, _ in series)
+    total_q = sum(q for _, _, q in series)
+    avg = total_o / len(series)
+    best = max(series, key=lambda s: s[1])
+    n_zero = sum(1 for _, o, _ in series if o == 0)
+
+    W, H, L, R, T, B = 760, 250, 46, 12, 20, 34
+    plot_h = H - T - B
+    step, top = nice_axis(best[1])
     n = len(series)
-    xs = [L + (W - L - R) * (i / (n - 1 if n > 1 else 1)) for i in range(n)]
-    ys = [T + (H - T - B) * (1 - v / vmax) for _, v in series]
-    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
-    area = f"{xs[0]:.1f},{H - B} " + line + f" {xs[-1]:.1f},{H - B}"
-    grid = ""
-    for frac in (0, 0.5, 1):
-        gy = T + (H - T - B) * (1 - frac)
-        grid += (f'<line x1="{L}" y1="{gy:.1f}" x2="{W - R}" y2="{gy:.1f}" stroke="#e2e8f0" stroke-dasharray="4 4"/>'
-                 f'<text x="{L - 8}" y="{gy + 4:.1f}" text-anchor="end" font-size="11" fill="#64748b">{vmax * frac:g}</text>')
-    labels = ""
-    for i in sorted({0, n // 2, n - 1}):
-        d = parse_iso_date(series[i][0])
-        labels += (f'<text x="{xs[i]:.1f}" y="{H - 10}" text-anchor="middle" font-size="11" fill="#64748b">'
-                   f'{d.strftime("%d/%m") if d else series[i][0]}</text>')
-    best_i = max(range(n), key=lambda i: series[i][1])
-    worst_i = min(range(n), key=lambda i: series[i][1])
-    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#0284c7"/>' for x, y in zip(xs, ys)) if n <= 45 else ""
-    marks = (f'<circle cx="{xs[best_i]:.1f}" cy="{ys[best_i]:.1f}" r="6" fill="#16a34a" stroke="#fff" stroke-width="2"><title>Cao nhất: {series[best_i][1]:g} phần ({series[best_i][0]})</title></circle>'
-             f'<circle cx="{xs[worst_i]:.1f}" cy="{ys[worst_i]:.1f}" r="6" fill="#ef4444" stroke="#fff" stroke-width="2"><title>Thấp nhất: {series[worst_i][1]:g} phần ({series[worst_i][0]})</title></circle>')
-    return f"""
-    <svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;max-height:300px;">
-      {grid}
-      <polygon points="{area}" fill="#e0f2fe" opacity=".85"/>
-      <polyline points="{line}" fill="none" stroke="#0284c7" stroke-width="2.5" stroke-linejoin="round"/>
-      {dots}{marks}{labels}
-    </svg>
-    <p class="muted" style="margin-top:6px;"><span style="color:#16a34a;">●</span> Ngày bán cao nhất ({series[best_i][1]:g} phần, {series[best_i][0]})
-       &nbsp; <span style="color:#ef4444;">●</span> Ngày bán thấp nhất ({series[worst_i][1]:g} phần, {series[worst_i][0]})</p>"""
+    band = (W - L - R) / n
+    bw = max(2.0, min(28, band * 0.7))
+    out = ""
+    for k in range(int(top // step) + 1):
+        tick = step * k
+        gy = T + plot_h * (1 - tick / top)
+        out += (f'<line x1="{L}" y1="{gy:.1f}" x2="{W - R}" y2="{gy:.1f}" stroke="#e2e8f0"/>'
+                f'<text x="{L - 8}" y="{gy + 4:.1f}" text-anchor="end" font-size="11" fill="#64748b">{tick:g}</text>')
+    label_every = max(1, math.ceil(n / 12))
+    for i, (k, o, q) in enumerate(series):
+        cx = L + band * i + band / 2
+        h = plot_h * o / top
+        c = "#16a34a" if (o == best[1] and o > 0) else "#0284c7"
+        out += (f'<g><title>{fmt(k)}: {o} đơn · {q:g} phần</title>'
+                f'<rect x="{cx - band / 2:.1f}" y="{T}" width="{band:.1f}" height="{plot_h}" fill="transparent"/>'
+                f'<rect x="{cx - bw / 2:.1f}" y="{T + plot_h - h:.1f}" width="{bw:.1f}" height="{h:.1f}" rx="2" fill="{c}"/></g>')
+        if i % label_every == 0 or (i == n - 1 and i % label_every >= max(2, label_every * 0.7)):
+            out += (f'<text x="{cx:.1f}" y="{H - 12}" text-anchor="middle" font-size="11" fill="#64748b">'
+                    f'{fmt(k).replace("Tuần ", "")}</text>')
+    if total_o:
+        ay = T + plot_h * (1 - avg / top)
+        out += (f'<line x1="{L}" y1="{ay:.1f}" x2="{W - R}" y2="{ay:.1f}" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6 4"/>'
+                f'<text x="{L + 6}" y="{ay - 5:.1f}" font-size="11" font-weight="700" fill="#b45309" paint-order="stroke" stroke="#fff" stroke-width="3">TB {avg:.1f} đơn/{unit_name}</text>')
+    out += f'<text x="{L - 34}" y="{T - 8}" font-size="11" fill="#64748b">đơn</text>'
+    summary = (f'Tổng <b>{total_o}</b> đơn · {total_q:g} phần · trung bình <b>{avg:.1f}</b> đơn/{unit_name} · '
+               f'cao nhất <b>{fmt(best[0])}</b> ({best[1]} đơn)')
+    if n_zero:
+        summary += f' · <span style="color:#b91c1c;">{n_zero}/{n} {unit_name} không có đơn nào</span>'
+    group_note = {"day": "", "week": " (gom theo tuần)", "month": " (gom theo tháng)"}[mode]
+    return (f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;max-height:300px;" role="img" '
+            f'aria-label="Số đơn theo {unit_name}{group_note}">{out}</svg>'
+            f'<p class="muted" style="margin-top:6px;">{summary}{group_note}. Rê chuột lên cột để xem số đơn và số phần.</p>')
 
 
 def donut_html(rows):
@@ -6831,7 +6894,8 @@ def analysis():
     stats = collect_item_stats(conn, start_date_str, end_date_str, category_filter, item_filter)
 
     trend_sql = """
-        SELECT date(o.order_date) AS d, SUM(od.quantity - COALESCE(od.canceled_quantity, 0)) AS qty
+        SELECT date(o.order_date) AS d, COUNT(DISTINCT o.order_id) AS orders,
+               SUM(od.quantity - COALESCE(od.canceled_quantity, 0)) AS qty
         FROM order_details od
         JOIN orders o ON o.order_id = od.order_id
         JOIN items ON items.item_id = od.item_id
@@ -6845,8 +6909,16 @@ def analysis():
         trend_sql += " AND items.item_id = ?"
         t_params.append(item_filter)
     trend_sql += " GROUP BY date(o.order_date) ORDER BY d"
-    trend_points = [(str(r["d"]), float(r["qty"] or 0)) for r in conn.execute(trend_sql, t_params).fetchall()]
+    trend_points = [(str(r["d"]), int(r["orders"] or 0), float(r["qty"] or 0))
+                    for r in conn.execute(trend_sql, t_params).fetchall()]
+    # Khoảng ngày thực có đơn hàng trong database: để báo khi khoảng đang xem gần như không có đơn.
+    span_row = conn.execute("""SELECT MIN(date(order_date)) AS first_day, MAX(date(order_date)) AS last_day,
+                                      COUNT(*) AS n FROM orders WHERE status != 'Đã hủy'""").fetchone()
     conn.close()
+    data_first = str(span_row["first_day"] or "")[:10]
+    data_last = str(span_row["last_day"] or "")[:10]
+    data_total = int(span_row["n"] or 0)
+    orders_in_range = sum(o for _, o, _ in trend_points)
 
     can_promote = get_current_user()["role"] in ("admin", "cashier")
     sold_rows = [r for r in stats if r["total_sold"] > 0]
@@ -6876,9 +6948,12 @@ def analysis():
           <div style="display:grid;gap:10px;">{"".join(analysis_card_html(r, "#16a34a", medal=medals[i + 1]) for i, r in enumerate(top[1:]))}</div>
         </div>"""
 
-    # --- biểu đồ cột món bán chạy (màu xanh) ---
-    best_chart = column_chart_svg([{"label": r["item_name"], "value": r["total_sold"]} for r in sold_rows[:10]],
-                                  "#16a34a", "phần")
+    # --- biểu đồ cột món bán chạy: màu theo mức bán (bán chạy / trung bình / bán chậm) ---
+    best_chart = column_chart_svg(
+        [{"label": r["item_name"], "value": r["total_sold"], "color": TIER_META[r["tier"]][2]} for r in sold_rows[:10]],
+        "#16a34a", "phần",
+        legend=[(f'{TIER_META[t][0]}{" (top ~30%)" if t == "best" else " (~30% cuối)" if t == "slow" else ""}', TIER_META[t][2])
+                for t in ("best", "mid", "slow") if any(r["tier"] == t for r in sold_rows[:10])])
 
     # --- bán chậm: biểu đồ cột màu đỏ + đề xuất giảm giá theo số đơn ---
     top_ids = {r["item_id"] for r in sold_rows[:5]}
@@ -6892,9 +6967,17 @@ def analysis():
     zero_rows = [r for r in slow_list if r["order_count"] == 0]
     chart_rows = (zero_rows[:6] + [r for r in slow_list if r["order_count"] > 0])[:12]
     hidden_zero = len(zero_rows) - min(len(zero_rows), 6)
+    # Màu theo mức giảm đề xuất: càng ít đơn càng đỏ đậm, nhìn là biết món nào cần xử lý trước.
+    suggest_colors = {50: "#b91c1c", 30: "#f97316", 10: "#eab308", 0: "#94a3b8"}
+    suggest_labels = {50: "0 đơn → đề xuất giảm 50%", 30: "1–3 đơn → giảm 30%", 10: "4–10 đơn → giảm 10%", 0: "Trên 10 đơn → chưa cần giảm"}
     slow_chart = column_chart_svg(
-        [{"label": r["item_name"], "value": r["order_count"], "note": f'-{r["suggest"]}%' if r["suggest"] else ""} for r in chart_rows],
-        "#dc2626", "đơn")
+        [{"label": r["item_name"], "value": r["order_count"], "color": suggest_colors[r["suggest"]],
+          "note": f'-{r["suggest"]}%' if r["suggest"] else ""} for r in chart_rows],
+        "#dc2626", "đơn",
+        legend=[(suggest_labels[p], suggest_colors[p]) for p in (50, 30, 10, 0) if any(r["suggest"] == p for r in chart_rows)])
+    if hidden_zero > 0:
+        slow_chart += (f'<p class="muted" style="margin-top:4px;">Biểu đồ chỉ vẽ 6 món chưa có đơn; còn {hidden_zero} món '
+                       f'chưa có đơn khác ở bảng bên dưới.</p>')
     slow_html = '<p class="empty">Không có dữ liệu.</p>'
     if slow_list:
         slow_rows = ""
@@ -6976,8 +7059,27 @@ def analysis():
       .an-filter { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)) auto auto; gap:12px; align-items:end; }
       @media (max-width:1000px) { .an-filter { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     </style>"""
+    def range_link(label, start, end):
+        on = start == start_date_str and end == end_date_str
+        q = urlencode({"start_date": start, "end_date": end, "category_id": category_filter, "item_id": item_filter})
+        return f'<a class="btn {"btn-primary" if on else "btn-secondary"}" href="/analysis?{escape(q)}">{label}</a>'
+
+    today = date.today()
+    quick = [("7 ngày", (today - timedelta(days=6)).isoformat(), today.isoformat()),
+             ("30 ngày", (today - timedelta(days=30)).isoformat(), today.isoformat()),
+             ("90 ngày", (today - timedelta(days=89)).isoformat(), today.isoformat()),
+             ("Năm nay", date(today.year, 1, 1).isoformat(), today.isoformat())]
+    if data_first:
+        quick.append(("Toàn bộ dữ liệu", data_first, max(data_last, today.isoformat())))
+    quick_html = "".join(range_link(*q) for q in quick)
+    data_note = ""
+    if data_total and orders_in_range < data_total:
+        data_note = (f'<div class="notice" style="margin:12px 0 0;">Khoảng đang xem có <b>{orders_in_range}</b> đơn. '
+                     f'Database có <b>{data_total}</b> đơn, từ <b>{fmt_date(data_first)}</b> đến <b>{fmt_date(data_last)}</b>. '
+                     f'Bấm “Toàn bộ dữ liệu” để xem hết.</div>')
     filter_html = f"""
     <div class="panel">
+      <div class="actions" style="margin-bottom:12px;"><span class="muted">Xem nhanh:</span>{quick_html}</div>
       <form method="GET" action="/analysis" class="an-filter">
         <div class="form-group"><label>Từ ngày</label><input type="date" name="start_date" value="{escape(start_date_str)}" required></div>
         <div class="form-group"><label>Đến ngày</label><input type="date" name="end_date" value="{escape(end_date_str)}" required></div>
@@ -6986,6 +7088,7 @@ def analysis():
         <button class="btn btn-primary">Xem thống kê</button>
         <a class="btn btn-secondary" href="/analysis">Đặt lại</a>
       </form>
+      {data_note}
     </div>"""
     best_pane = f"""
     <div class="panel"><h2>Món bán chạy nhất</h2>{best_html}
@@ -7000,7 +7103,7 @@ def analysis():
         <p class="muted">{legend}</p><br>{chart_bars}</div>
       <div class="panel"><h2>Tỷ trọng doanh thu theo danh mục</h2><br>{donut_html(stats)}</div>
     </div>
-    <div class="panel"><h2>Xu hướng số phần bán theo ngày</h2><br>{trend_svg(trend_points, start_date_str, end_date_str)}</div>"""
+    <div class="panel"><h2>Số đơn theo thời gian</h2><br>{trend_svg(trend_points, start_date_str, end_date_str)}</div>"""
     table_pane = f"""
     <div class="panel">
       <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
